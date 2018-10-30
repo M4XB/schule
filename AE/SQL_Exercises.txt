@@ -1,0 +1,20 @@
+mysql -u root -p
+
+Aufgaben:
+1. Select * from products
+2. select * from orders inner join order_details on orders.id = order_details.id where order_details.status_id is not 3
+3. select * from customers
+4. select * from customers where last_name LIKE 'L%'
+5. select * from orders inner join order_details on orders.id = order_details.id where order_details.quantity >100.000
+6. 
+7. select * from products where ctegory LIKE 'Beverages'
+8.1: Gebe alle Bestellungen aus, die bereits verschifft wurden
+8.2: Gebe alle die Id von allen Produkte aus, die auf Lager sind und sortiere diese nach dem Preis absteigend
+8.3: Gebe die Differenz von der teuerste und der billigsten Bestellung aus
+
+
+LSG:
+8.1: select * from orders where status_id = 2
+8.2: select orders.id form orders inner join order_details on orders.id = order_details.id order by order_details.unit_price DESC
+
+
