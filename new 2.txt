@@ -1,0 +1,407 @@
+Imports System.IO
+Imports System.Windows.Forms
+Imports KlafkaUndHinz.Business.DataExchange.TableDefinitions
+Imports KlafkaUndHinz.Eap.Context
+Imports KlafkaUndHinz.Eap.Data
+Imports KlafkaUndHinz.Eap.Data.TableDefinitions
+Imports KlafkaUndHinz.Eap.PlugIns.Commands
+Imports KlafkaUndHinz.X.Collections
+Imports KlafkaUndHinz.X.Data
+Imports KlafkaUndHinz.X.Database.SQLCreator
+Imports KlafkaUndHinz.X.Localization
+Imports KlafkaUndHinz.X.Notification
+
+Namespace Edix.Configuration.ViewCommands
+  ''' <messagecodes name="EDIX-Config" from="00751" to="00800" last-used="EDIX-Config-00755"/>
+  <ViewCommandPlugIn("SysDatenformatDef", "AuswahlErzeugen")>
+  Public Class GenerateSelection
+    Implements IViewCommandPlugInMultiRecord
+
+    Private Shared ReadOnly L As New UiTextFactory("a:Edix.Configuration")
+    ''' <summary>
+    ''' Aus der Tabelle FX_DatenfkatAuswahlDef wird eine KHXML für die FX_Auswahldef erstellt
+    ''' In der KHXML stehen die Datensätze die gelöscht und hinzugefügt werden sollen
+    ''' Sollte es doppelte Einträge (alles gleich außer die Beschreibung), nicht existierende Tabellen oder fehlende Beschreibungen geben, so wird ein Fehler oder ein Hinweis ausgegeben
+    ''' </summary>
+    ''' <param name="args"></param>
+    Public Sub Execute(args As IViewCommandPlugInMultiRecord.Arguments) Implements IViewCommandPlugInMultiRecord.Execute
+
+
+      Using s = KhContextScope.CreateLocalized()
+
+        Dim savePath = s.Arguments.GetString("speicherpfad", "")
+        Dim plist As IReadOnlyList(Of SelectionTable)
+        Using dc = DisposableContainer.Create()
+          Dim plugin = args.IdSelection.AsWhereNodePlugin(dc, "fDef.DATENFORMATID")
+
+          Dim command = TableService("SysDatenformatDef").CreateSelectCommand("Edix.Configuration.ViewCommands",
+            Sub(builder)
+              Dim fDef = New SysDatenFormatDef_Sql("fDef")
+              Dim fKat = New FX_DatenfKat_Sql("fKat")
+              Dim kFeld = New FX_DatenfKatFeld_Sql("kFeld")
+              Dim fAusw = New FX_DatenfKatFeldAusw_Sql("fAusw")
+              'SQL Befehl Einbettung zum Erstellen einer Ergebnisliste 
+              With builder
+                .Select(kFeld.Tabelle, kFeld.Feld, fAusw.Wert, fAusw.Beschreibung).Distinct()
+                .Select(fKat.FS)
+                'Durch InnerJoins werden die Tabellen miteinander verknüpft
+                With .From(fDef)
+                  .InnerJoin(fKat, fDef.DatenformatID = fKat.DatenformatID)
+                  .InnerJoin(kFeld, fKat.DatenfKatID = kFeld.DatenfKatID)
+                  .InnerJoin(fAusw, kFeld.DatenfKatFeldID = fAusw.DatenfKatFeldID)
+                End With
+
+              End With
+            End Sub, plugin)
+          plist = command.ExecuteToTypedSequence(Of SelectionTable)
+        End Using
+
+
+        'Liste nach Gruppen sortieren
+        Dim groupedByTable = plist.GroupBy(Function(x) x.Tabelle)
+        'Liste der Felder im Löschen Knoten Format Tabelle:Feld
+        Dim listToDelete As New List(Of XNode)
+        'Tabellen durchlaufen
+        'Boolean um festzustellen, ob keiner der Tabellen existiert
+        Dim noTables = True
+        For Each tableGroup In groupedByTable
+          'Der Tabellenname wird gekürzt, da bei manchen Tabellen ein +"irgendwas" dranhängt
+          Dim table = tableGroup.Key
+          Dim tableReal As String() = table.Split(New String() {"+"}, StringSplitOptions.None)
+          Dim editList As New List(Of String)
+          For Each objEdit In tableReal
+            editList.Add(objEdit)
+          Next
+          Dim tableEdit = editList.First().ToString()
+          Dim groupedByArray = tableGroup.GroupBy(Function(x) x.Feld)
+
+          If TableService.TableMaybe(tableEdit)?.ExistsInDb() Then
+            noTables = False
+            'Felder durchlaufen
+            For Each feld In groupedByArray
+              'Struktur der XNodes
+              If TableService(tableEdit).Columns.ColumnExistsInDb(feld.Key) = True Then
+                'XNode Struktur
+                Dim toDelete As XNode = <DSLoeschen>
+                                          <Filter>
+                                            <Bedingung Feld="SpalteAKey" Vergleich="=" Wert=<%= writeBig(tableEdit, feld.Key) %>/>
+                                          </Filter>
+                                        </DSLoeschen>
+                listToDelete.Add(toDelete)
+              Else
+                Continue For
+              End If
+
+            Next
+          End If
+        Next
+        If noTables = True Then
+          errorMessageNoTable()
+          Exit Sub
+        End If
+
+        'Dublettensuche (Gleiche Tabelle, gleiches Feld, gleicher Wert und unterschiedliche Beschreibung)
+        Dim fError As Boolean = False
+        'Gruppierung über Tabelle, Feld und Wert
+        Dim multipleGroupBy = plist.GroupBy(Function(x) New With {Key .Tabelle = x.Tabelle,
+                                            Key .Feld = x.Feld,
+                                            Key .Wert = x.Wert}).ToList()
+        'Gruppierte Liste nach Beschreibung gruppieren, um festzustellen, ob es Dublettn gibt
+        'Dim categories As New List(Of String)
+        Dim categories As New List(Of String)
+        For Each record In multipleGroupBy
+          Dim eror = record.GroupBy(Function(l) l.Beschreibung).ToList()
+          If eror.Count() > 1 Then
+            Dim errTabelle = record.Key.Tabelle
+            Dim errFeld = record.Key.Feld
+            Dim errWert = record.Key.Wert
+            fError = True
+            'Ermitteln welche FS betroffen sind und mit in die Fehlermeldung einbauen, wenn es nicht mehr als 5 sind
+            For Each category In record
+              If Not categories.Contains(category.Fs) Then
+                categories.Add(category.Fs)
+              End If
+            Next
+            errorMessageDoubleTags(errTabelle, errFeld, errWert, categories)
+          End If
+
+        Next
+        If fError = True Then
+          Exit Sub
+        End If
+        'Liste der Felder im Hinzufügen Knoten Format Tabelle 
+        Dim secondPartOfXML As New List(Of XNode)
+        Dim pTableAdd = plist.GroupBy(Function(y) y.Tabelle)
+        Dim pListToAdd As New List(Of String)
+        Dim listToAdd As New List(Of XNode)
+        'Tabellen durchlaufen
+
+
+        For Each pObject In pTableAdd
+          Dim tabelle = pObject.Key
+          Dim result As String() = tabelle.Split(New String() {"+"}, StringSplitOptions.None)
+          Dim editList As New List(Of String)
+          For Each objEdit As String In result
+            editList.Add(objEdit)
+          Next
+          Dim tabelleEdit = editList.First()
+          'Prüfen, ob tabelle existiert (Temporäre Tabellen gehören nicht zu den existierenden)
+          If TableService(tabelleEdit).ExistsInDb() = True Then
+
+            Dim felder = pObject.GroupBy(Function(y) y.Feld)
+            'Felder durchlaufen
+            For Each feld In felder
+              'Prüfen ob spalte existiert
+              If TableService(tabelleEdit).Columns.ColumnExistsInDb(feld.Key) = True Then
+                pListToAdd.Add(tabelleEdit + ": " + feld.Key)
+                'erste XNode Struktur der 2ten XML Datei
+                Dim nodeFirst As XNode = <Daten Typ="Tabelle" Name="ADTabSpEig">
+                                           <DSBearb>
+                                             <Felder>
+                                               <Feld Name="Auswahl" Wert="-1"/>
+                                             </Felder>
+                                             <Filter>
+                                               <Bedingung Feld="TabellenID" Vergleich="=" Wert=<%= tabelleEdit %> WertFeld="TabellenID" DefFeld="Name" DefTabelle="SysKDTabellenDef"/>
+                                               <Bedingung Verknuepfung="AND" Feld="Spalte" Vergleich="=" Wert=<%= feld.Key %>/>
+                                             </Filter>
+                                           </DSBearb>
+                                         </Daten>
+                'zweite Xnode Struktur der 2ten XML Datei
+                Dim nodeSecond As XNode = <Daten Typ="Tabelle" Name="ADTabSpEig">
+                                            <Voraussetzungen>
+                                              <Voraussetzung Tabelle="ADTabSpEig">
+                                                <Filter Max="0">
+                                                  <Bedingung Feld="TabellenID" Vergleich="=" Wert=<%= tabelleEdit %> WertFeld="TabellenID" DefFeld="name" DefTabelle="SysKDTabellenDef"/>
+                                                  <Bedingung Verknuepfung="AND" Feld="Spalte" Vergleich="=" Wert=<%= feld.Key %>/>
+                                                </Filter>
+                                              </Voraussetzung>
+                                            </Voraussetzungen>
+                                            <DSHinz>
+                                              <Felder>
+                                                <Feld Name="TabellenID" Wert=<%= tabelleEdit %> DefTabelle="SysKDTabellenDef" DefFeld="Name" WertFeld="TabellenID"/>
+                                                <Feld Name="SPALTE" Wert=<%= feld.Key %>/>
+                                                <Feld Name="AUSWAHL" Wert="-1"/>
+                                              </Felder>
+                                            </DSHinz>
+                                          </Daten>
+                'Beide XNodes in XNode Liste einfügen
+                secondPartOfXML.Add(nodeFirst)
+                secondPartOfXML.Add(nodeSecond)
+                'Reihenfolge zählen, für mehr Überblick
+                Dim count = 10
+                'Liste durchlaufen und Felder in Knotenliste speichern
+                Dim groupedAuswahl = feld.GroupBy(Function(z) z.Wert)
+                For Each auswahl In groupedAuswahl.OrderBy(Function(x) x.Key)
+                  'Struktur der XNodes wenn die Beschreibung leer ist
+                  If auswahl.First.Beschreibung = "" Then
+                    Dim toAdd As XNode = <DSHinz>
+                                           <Felder>
+                                             <Feld Name="SPALTEAKEY" Wert=<%= writeBig(tabelleEdit, feld.Key) %>/>
+                                             <Feld Name="NAME" Wert=<%= auswahl.Key %>/>
+                                             <Feld Name="REIHENFOLGE" Wert=<%= count %>/>
+                                           </Felder>
+                                         </DSHinz>
+                    listToAdd.Add(toAdd)
+                    count += 10
+                    'Feld angeben
+                    errorMessageNoBesch(auswahl.First.Tabelle, auswahl.First.Fs, feld.Key)
+                    'Struktur der "normalen "XNodes 
+                  Else
+                    Dim toAdd As XNode = <DSHinz>
+                                           <Felder>
+                                             <Feld Name="SPALTEAKEY" Wert=<%= writeBig(tabelleEdit, feld.Key) %>/>
+                                             <Feld Name="NAME" Wert=<%= auswahl.Key %>/>
+                                             <Feld Name="BESCHREIBUNG" Wert=<%= auswahl.First.Beschreibung %>/>
+                                             <Feld Name="REIHENFOLGE" Wert=<%= count %>/>
+                                           </Felder>
+                                         </DSHinz>
+                    listToAdd.Add(toAdd)
+
+                    count += 10
+                  End If
+                Next
+              Else
+                Continue For
+              End If
+            Next
+          Else
+            Continue For
+          End If
+        Next
+
+
+        Dim pXmlDoc = XmlStructure(listToDelete, listToAdd, secondPartOfXML)
+        Dim pformatSave As String = "yyyyMMddHHmm"
+        Dim pDateSave = Format(Date.Now, pformatSave)
+        'Prüfen, ob der Pfad existiert und ggfs über Dialog besetzen
+        If savePath = "" Then
+          'pfad zum speicher benutzen
+          savePath = Save()
+          'savepath = funktionsaufruf
+          'dialog anzeigen
+        Else
+
+          'Prüfen, ob der übergebene Pfad existiert
+          If Not Directory.Exists(savePath) Then
+            errorMessageNonExistingSavePath()
+          Else
+            savePath = savePath + "\Auswahl" + pDateSave + ".xml"
+          End If
+        End If
+        pXmlDoc.Save(savePath)
+
+
+
+        'datei speichern im savepath
+
+      End Using
+    End Sub
+    ''' <summary>
+    ''' Fehlermeldung, wenn Dubletten vorhanden sind
+    ''' </summary>
+    ''' <param name="errTabelle"></param>
+    ''' <param name="errFeld"></param>
+    ''' <param name="errWert"></param>
+    ''' <param name="errCategory"></param>
+    Private Sub errorMessageDoubleTags(errTabelle As String, errFeld As String, errWert As String, errCategory As List(Of String))
+      With NotificationService.Error("EDIX-Config-00751")
+        .Text = L("Doppelte Auswahl mit unterschiedlichen Beschreibungen gefunden")
+        .SetNonModal()
+
+        'Datenformatkategorien ausgeben
+
+        .Parameters.Add(L("Tabelle"), errTabelle)
+        .Parameters.Add(L("Feld"), errFeld)
+        .Parameters.Add(L("Wert"), errWert)
+        For Each obj In errCategory
+          .Parameters.Add(L("Datenformatkategorie"), obj)
+        Next
+        .ShowDoNotThrow()
+      End With
+    End Sub
+    ''' <summary>
+    ''' Fehlermeldung, wenn der Speicherpfad ungültig ist
+    ''' </summary>
+    Private Sub errorMessageNonExistingSavePath()
+      With NotificationService.Error("EDIX-Config-00752")
+        .Text = L("Der Pfad ist ungültig")
+        .SetNonModal()
+        Throw .ShowWithException()
+      End With
+    End Sub
+
+    ''' <summary>
+    ''' Fehlermeldung, wenn ein Datenstz keine Beschreibung hat
+    ''' </summary>
+    ''' <param name="table"></param>
+    ''' <param name="fs"></param>
+    Private Sub errorMessageNoBesch(table As String, fs As String, selection As String)
+      With NotificationService.Error("EDIX-Config-00753")
+        .Text = L("Ein Datensatz hat keine Beschreibung")
+        .Parameters.Add(L("Tabelle"), table)
+        .Parameters.Add(L("Datenformatkategorie"), fs)
+        .Parameters.Add(L("Auswahl"), selection)
+        .SetNonModal()
+        .ShowDoNotThrow()
+      End With
+    End Sub
+    ''' <summary>
+    ''' Mitteilung, wenn die KHXML erstellt wurde
+    ''' </summary>
+    Private Sub erfolg()
+      With NotificationService.Message("EDIX-Config-00754")
+        .Text = L("Die Datei wurde erfolgreich gespeichert")
+        .SetNonModal()
+        .Show()
+
+      End With
+    End Sub
+    ''' <summary>
+    ''' Fehlermeldung, wenn keine der Tabellen in der DB existiert
+    ''' </summary>
+    Private Sub errorMessageNoTable()
+      With NotificationService.Hint("EDIX-Config-00755")
+        .Text = L("Es wird keine Datei erstellt, weil die Tabellen nicht in der Datenbank existieren")
+        .SetNonModal()
+        .Show()
+      End With
+    End Sub
+    ''' <summary>
+    ''' Schreibt die übergeben Strings in Caps und fügt sie zusammen
+    ''' </summary>
+    ''' <param name="sTabelle"></param>
+    ''' <param name="sFeld"></param>
+    ''' <returns></returns>
+    Private Function writeBig(sTabelle As String, sFeld As String) As String
+      Return sTabelle.ToUpper() + ":" + sFeld.ToUpper()
+    End Function
+    ''' <summary>
+    ''' Baut die Grundstruktur der 1ten XML Datei auf
+    ''' </summary>
+    ''' <param name="listToDelete"></param>
+    ''' <param name="listToAdd"></param>
+    ''' <returns></returns>
+    Private Function XmlStructure(listToDelete As List(Of XNode), listToAdd As List(Of XNode), flag As List(Of XNode)) As XDocument
+      'Grundstruktur der XML Datei aufbauen
+      Dim pformat As [String] = "dd.MM.yyyy HH:mm:ss"
+      Dim pDate = Format(Date.Now, pformat)
+      Dim pXmlDoc As XDocument = <?xml version="1.0" encoding="UTF-8"?>
+                                 <?xml-stylesheet type="text/xsl" href="khXMLStSh.xsl"?>
+                                 <FirstX erstelltAm=<%= pDate %> Rollback="false" Beschreibung="KH">
+                                   <Sender Benutzername="KHEIS" ObjektFS="Netzbetreiber" Signatur="ED1DD443FD6187FD01C5492DC2513953E9F22C25" Produktname="FirstNet" Versionsnummer="Version 6.59.01"/>
+                                   <Empfaenger/>
+                                 </FirstX>
+      'Container erstellen, in den die Liste mit den zu löschenden Datein eingefügt wird
+      Dim del As XContainer = <Daten Typ="Tabelle" Name="FX_AuswahlDef">
+                              </Daten>
+      For Each obj In listToDelete
+        del.Add(obj)
+      Next
+      'Container erstellen, in den die Liste mit den zu eintragenden Datein eingefügt wird
+      Dim add As XContainer = <Daten Typ="Tabelle" Name="FX_AuswahlDef">
+                              </Daten>
+      For Each obj In listToAdd
+        add.Add(obj)
+      Next
+      'Die beiden erstellten und befüllten Container werden in die Grundstruktur eingefügt
+      pXmlDoc.Root.Add(del)
+      pXmlDoc.Root.Add(add)
+      pXmlDoc.Root.Add(flag)
+      Return pXmlDoc
+    End Function
+    ''' <summary>
+    ''' Speichert die XML Datei in dem des Benutzers ausgewählten Ordners
+    ''' Das Datum wird formatiert, um es in den Namen der xml Datei hinzufügen zu können
+    ''' </summary>
+    Private Function Save() As String
+      Dim pformatSave As String = "yyyyMMddHHmm"
+      Dim pDateSave = Format(Date.Now, pformatSave)
+      Dim exportPath = ""
+      With New FolderBrowserDialog()
+        .RootFolder = Environment.SpecialFolder.Desktop
+        If .ShowDialog = DialogResult.OK Then
+          exportPath = .SelectedPath.ToString() + "\Auswahl" + pDateSave + ".xml"
+
+        Else
+        End If
+      End With
+      erfolg()
+      Return exportPath
+    End Function
+    'Ausgaben der Tabellen, die uns interessieren
+    Private Class SelectionTable
+      <DataColumn("Tabelle")>
+      Public Property Tabelle As String
+      <DataColumn("Feld")>
+      Public Property Feld As String
+      <DataColumn("Wert")>
+      Public Property Wert As String
+      <DataColumn("Beschreibung")>
+      Public Property Beschreibung As String
+      <DataColumn("fs")>
+      Public Property Fs As String
+
+
+    End Class
+  End Class
+End Namespace
